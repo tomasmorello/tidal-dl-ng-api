@@ -1,114 +1,181 @@
-import json
+#!/usr/bin/env python
+from typing import List, Union, Optional, Dict, Any
+import uuid
 
-import requests
+from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks, Body
+from pydantic import BaseModel
 
-# See also
-# https://github.com/yaronzz/Tidal-Media-Downloader/commit/1d5b8cd8f65fd1def45d6406778248249d6dfbdf
-# https://github.com/yaronzz/Tidal-Media-Downloader/pull/840
-# https://github.com/nathom/streamrip/tree/main/streamrip
-# https://github.com/arnesongit/plugin.audio.tidal2/blob/e9429d601d0c303d775d05a19a66415b57479d87/resources/lib/tidal2/tidalapi/__init__.py#L86
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
-# TODO: Implement this into `Download`: Session should randomize the usage.
-__KEYS_JSON__ = """
-{
-    "version": "1.0.1",
-    "keys": [
-        {
-            "platform": "Fire TV",
-            "formats": "Normal/High/HiFi(No Master)",
-            "clientId": "OmDtrzFgyVVL6uW56OnFA2COiabqm",
-            "clientSecret": "zxen1r3pO0hgtOC7j6twMo9UAqngGrmRiWpV7QC1zJ8=",
-            "valid": "False",
-            "from": "Fokka-Engineering (https://github.com/Fokka-Engineering/libopenTIDAL/blob/655528e26e4f3ee2c426c06ea5b8440cf27abc4a/README.md#example)"
-        },
-        {
-            "platform": "Fire TV",
-            "formats": "Master-Only(Else Error)",
-            "clientId": "7m7Ap0JC9j1cOM3n",
-            "clientSecret": "vRAdA108tlvkJpTsGZS8rGZ7xTlbJ0qaZ2K9saEzsgY=",
-            "valid": "True",
-            "from": "Dniel97 (https://github.com/Dniel97/RedSea/blob/4ba02b88cee33aeb735725cb854be6c66ff372d4/config/settings.example.py#L68)"
-        },
-        {
-            "platform": "Android TV",
-            "formats": "Normal/High/HiFi(No Master)",
-            "clientId": "Pzd0ExNVHkyZLiYN",
-            "clientSecret": "W7X6UvBaho+XOi1MUeCX6ewv2zTdSOV3Y7qC3p3675I=",
-            "valid": "False",
-            "from": ""
-        },
-        {
-            "platform": "TV",
-            "formats": "Normal/High/HiFi/Master",
-            "clientId": "8SEZWa4J1NVC5U5Y",
-            "clientSecret": "owUYDkxddz+9FpvGX24DlxECNtFEMBxipU0lBfrbq60=",
-            "valid": "False",
-            "from": "morguldir (https://github.com/morguldir/python-tidal/commit/50f1afcd2079efb2b4cf694ef5a7d67fdf619d09)"
-        },
-        {
-            "platform": "Android Auto",
-            "formats": "Normal/High/HiFi/Master",
-            "clientId": "zU4XHVVkc2tDPo4t",
-            "clientSecret": "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=",
-            "valid": "True",
-            "from": "1nikolas (https://github.com/yaronzz/Tidal-Media-Downloader/pull/840)"
-        }
-    ]
-}
-"""
-__API_KEYS__ = json.loads(__KEYS_JSON__)
-__ERROR_KEY__ = (
-    {
-        "platform": "None",
-        "formats": "",
-        "clientId": "",
-        "clientSecret": "",
-        "valid": "False",
-    },
+from tidal_dl_ng import __version__
+from tidal_dl_ng.config import Settings, Tidal
+from tidal_dl_ng.constants import MediaType
+from tidal_dl_ng.download import Download
+from tidal_dl_ng.helper.path import get_format_template
+from tidal_dl_ng.helper.tidal import (
+    all_artist_album_ids,
+    get_tidal_media_id,
+    get_tidal_media_type,
+    instantiate_media,
 )
+from tidal_dl_ng.helper.wrapper import LoggerWrapped
+from tidal_dl_ng.model.cfg import HelpSettings
 
-from tidal_dl_ng.constants import REQUESTS_TIMEOUT_SEC
+app = FastAPI()
 
+class TidalContext:
+    def __init__(self):
+        self.settings = Settings()
+        self.tidal = Tidal(self.settings)
 
-def getNum():
-    return len(__API_KEYS__["keys"])
+def get_tidal_context():
+    return TidalContext()
 
+class DownloadRequest(BaseModel):
+    urls: Union[List[str], str]
 
-def getItem(index: int):
-    if index < 0 or index >= len(__API_KEYS__["keys"]):
-        return __ERROR_KEY__
-    return __API_KEYS__["keys"][index]
+class DownloadManager:
+    def __init__(self):
+        self.active_downloads: Dict[str, Any] = {}
 
+    def add_download(self, download_id: str, urls: List[str]):
+        self.active_downloads[download_id] = {
+            "urls": urls,
+            "status": "in_progress",
+            "progress": 0
+        }
 
-def isItemValid(index: int):
-    item = getItem(index)
-    return item["valid"] == "True"
+    def update_progress(self, download_id: str, progress: int):
+        if download_id in self.active_downloads:
+            self.active_downloads[download_id]["progress"] = progress
 
+    def set_status(self, download_id: str, status: str):
+        if download_id in self.active_downloads:
+            self.active_downloads[download_id]["status"] = status
 
-def getItems():
-    return __API_KEYS__["keys"]
+    def get_status(self, download_id: str):
+        return self.active_downloads.get(download_id, None)
 
+    def is_available(self):
+        return all(download["status"] != "in_progress" for download in self.active_downloads.values())
 
-def getLimitIndexs():
-    array = []
-    for i in range(len(__API_KEYS__["keys"])):
-        array.append(str(i))
-    return array
+download_manager = DownloadManager()
 
+@app.get("/version")
+async def version():
+    return {"version": __version__}
 
-def getVersion():
-    return __API_KEYS__["version"]
+@app.post("/settings")
+async def settings_management(names: Optional[List[str]] = Body(None)):
+    settings = Settings()
+    d_settings = settings.data.to_dict()
 
+    if names:
+        if names[0] not in d_settings:
+            raise HTTPException(status_code=400, detail=f'Option "{names[0]}" is not valid!')
+        else:
+            if len(names) == 1:
+                return {names[0]: d_settings[names[0]]}
+            elif len(names) > 1:
+                settings.set_option(names[0], names[1])
+                settings.save()
+    else:
+        return {"settings": d_settings}
 
-# Load from gist
-try:
-    respond = requests.get(
-        "https://api.github.com/gists/48d01f5a24b4b7b37f19443977c22cd6", timeout=REQUESTS_TIMEOUT_SEC
+@app.post("/login")
+async def login(tidal_context: TidalContext = Depends(get_tidal_context)):
+    result = tidal_context.tidal.login(fn_print=print)
+    return {"login_successful": result}
+
+@app.post("/logout")
+async def logout(tidal_context: TidalContext = Depends(get_tidal_context)):
+    result = tidal_context.tidal.logout()
+    if result:
+        return {"message": "You have been successfully logged out."}
+    else:
+        return {"message": "Logout failed."}
+
+@app.post("/download")
+async def download(request: DownloadRequest, background_tasks: BackgroundTasks, tidal_context: TidalContext = Depends(get_tidal_context)):
+    urls = request.urls
+    if isinstance(urls, str):
+        urls = [urls]
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="Provide at least one URL")
+
+    settings = tidal_context.settings
+
+    # Genera un ID único para la descarga
+    download_id = str(uuid.uuid4())
+    download_manager.add_download(download_id, urls)
+
+    background_tasks.add_task(process_download, download_id, urls, settings, tidal_context)
+
+    return {"status": "Download started", "download_id": download_id}
+
+def process_download(download_id: str, urls: List[str], settings: Settings, tidal_context: TidalContext):
+    progress = Progress(
+        "{task.description}",
+        SpinnerColumn(),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
     )
-    if respond.status_code == 200:
-        content = respond.json()["files"]["tidal-api-key.json"]["content"]
-        __API_KEYS__ = json.loads(content)
-except Exception as e:
-    # TODO: Implement proper logging.
-    print(e)
-    pass
+    fn_logger = LoggerWrapped(print)
+    dl = Download(
+        session=tidal_context.tidal.session,
+        skip_existing=settings.data.skip_existing,
+        path_base=settings.data.download_base_path,
+        fn_logger=fn_logger,
+        progress=progress,
+    )
+
+    urls_pos_last = len(urls) - 1
+
+    for item in urls:
+        media_type = False
+
+        if "http" in item:
+            media_type = get_tidal_media_type(item)
+            item_id = get_tidal_media_id(item)
+            file_template = get_format_template(media_type, settings)
+
+        if not media_type:
+            print(f"It seems like that you have supplied an invalid URL: {item}")
+            continue
+
+        if media_type in [MediaType.TRACK, MediaType.VIDEO]:
+            download_delay = bool(settings.data.download_delay and urls.index(item) < urls_pos_last)
+            dl.item(media_id=item_id, media_type=media_type, file_template=file_template, download_delay=download_delay)
+        elif media_type in [MediaType.ALBUM, MediaType.PLAYLIST, MediaType.MIX, MediaType.ARTIST]:
+            item_ids = []
+
+            if media_type == MediaType.ARTIST:
+                media = instantiate_media(tidal_context.tidal.session, media_type, item_id)
+                media_type = MediaType.ALBUM
+                item_ids += all_artist_album_ids(media)
+            else:
+                item_ids.append(item_id)
+
+            for item_id in item_ids:
+                dl.items(
+                    media_id=item_id,
+                    media_type=media_type,
+                    file_template=file_template,
+                    video_download=settings.data.video_download,
+                    download_delay=settings.data.download_delay,
+                )
+
+    download_manager.set_status(download_id, "completed")
+
+@app.get("/download/status/{download_id}")
+async def get_download_status(download_id: str):
+    status = download_manager.get_status(download_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Download not found")
+    return status
+
+@app.get("/download/availability")
+async def check_availability():
+    available = download_manager.is_available()
+    return {"available": available}
