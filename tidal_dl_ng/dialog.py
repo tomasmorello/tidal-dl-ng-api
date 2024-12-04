@@ -1,4 +1,6 @@
+import datetime
 import os.path
+import shutil
 import webbrowser
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -8,7 +10,7 @@ from tidalapi import Quality as QualityAudio
 
 from tidal_dl_ng import __version__
 from tidal_dl_ng.config import Settings
-from tidal_dl_ng.constants import CoverDimensions, QualityVideo, SkipExisting
+from tidal_dl_ng.constants import CoverDimensions, QualityVideo
 from tidal_dl_ng.model.cfg import HelpSettings
 from tidal_dl_ng.model.cfg import Settings as ModelSettings
 from tidal_dl_ng.model.meta import ReleaseLatest
@@ -82,10 +84,12 @@ class DialogLogin(QtWidgets.QDialog):
 
     ui: Ui_DialogLogin
     url_redirect: str
-    return_code: int
 
-    def __init__(self, url_login: str, hint: str, parent=None):
+    def __init__(self, url_login: str, hint: str, expires_in: int, parent=None):
         super().__init__(parent)
+
+        datetime_current: datetime.datetime = datetime.datetime.now()
+        datetime_expires: datetime.datetime = datetime_current + datetime.timedelta(0, expires_in)
 
         # Create an instance of the GUI
         self.ui = Ui_DialogLogin()
@@ -93,12 +97,11 @@ class DialogLogin(QtWidgets.QDialog):
         # Run the .setupUi() method to show the GUI
         self.ui.setupUi(self)
         # Set data.
-        self.ui.tb_url_login.setText(f'<a href="{url_login}">{url_login}</a>')
+        self.ui.tb_url_login.setText(f'<a href="https://{url_login}">https://{url_login}</a>')
         self.ui.l_hint.setText(hint)
+        self.ui.l_expires_date_time.setText(datetime_expires.strftime("%Y-%m-%d %H:%M"))
         # Show
         self.return_code = self.exec()
-
-        self.url_redirect = self.ui.te_url_redirect.toPlainText()
 
 
 class DialogPreferences(QtWidgets.QDialog):
@@ -156,7 +159,6 @@ class DialogPreferences(QtWidgets.QDialog):
 
     def _init_comboboxes(self):
         self.parameters_combo = [
-            ("skip_existing", SkipExisting),
             ("quality_audio", QualityAudio),
             ("quality_video", QualityVideo),
             ("metadata_cover_dimension", CoverDimensions),
@@ -170,7 +172,9 @@ class DialogPreferences(QtWidgets.QDialog):
             "download_delay",
             "video_convert_mp4",
             "extract_flac",
-            "downgrade_on_hi_res",
+            "metadata_cover_embed",
+            "cover_album_file",
+            "skip_existing",
         ]
 
     def gui_populate(self):
@@ -182,10 +186,15 @@ class DialogPreferences(QtWidgets.QDialog):
         self,
         obj_line_edit: QtWidgets.QLineEdit,
         file_mode: QtWidgets.QFileDialog | QtWidgets.QFileDialog.FileMode = QtWidgets.QFileDialog.Directory,
+        path_default: str = None,
     ):
         # If a path is set, use it otherwise the users home directory.
-        settings_path: str = os.path.expanduser(obj_line_edit.text()) if obj_line_edit.text() else ""
-        dir_current: str = settings_path if settings_path and os.path.exists(settings_path) else str(Path.home())
+        path_settings: str = os.path.expanduser(obj_line_edit.text()) if obj_line_edit.text() else ""
+        # Check if obj_line_edit is empty but path_default can be usd instead
+        path_settings = (
+            path_settings if path_settings else os.path.expanduser(path_default) if path_default else path_settings
+        )
+        dir_current: str = path_settings if path_settings and os.path.exists(path_settings) else str(Path.home())
         dialog: QtWidgets.QFileDialog = QtWidgets.QFileDialog()
 
         # Set to directory mode only but show files.
@@ -222,7 +231,9 @@ class DialogPreferences(QtWidgets.QDialog):
         self.ui.pb_download_base_path.clicked.connect(lambda x: self.dialog_chose_file(self.ui.le_download_base_path))
         self.ui.pb_path_binary_ffmpeg.clicked.connect(
             lambda x: self.dialog_chose_file(
-                self.ui.le_path_binary_ffmpeg, file_mode=QtWidgets.QFileDialog.FileMode.ExistingFiles
+                self.ui.le_path_binary_ffmpeg,
+                file_mode=QtWidgets.QFileDialog.FileMode.ExistingFiles,
+                path_default=shutil.which("ffmpeg"),
             )
         )
 
